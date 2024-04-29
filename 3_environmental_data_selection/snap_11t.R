@@ -1,0 +1,120 @@
+##############
+## Code to snap selected sites to the closest hydrography of two environmental 
+# databases (RiverATLAS and Free Flowing Rivers).
+# 
+# RiverATLAS: https://www.hydrosheds.org/hydroatlas
+# Free-Flowing Rivers: https://figshare.com/articles/dataset/Mapping_the_world_s_free-flowing_rivers_data_set_and_technical_documentation/7688801 
+#
+### zone 11t
+
+# Required packages:
+library(rgdal)
+library(tidyverse)
+library(sf)
+
+data.na <- readOGR (dsn = ".",layer = "RiverATLAS_v10_na") # North America
+
+data_na_sf <- data.na %>% st_as_sf()
+
+
+# shapefile of world UTM zones (https://hub.arcgis.com/datasets/esri::world-utm-grid/about)
+utm.zones <-readOGR(dsn = ".", layer = "0f893164-d038-48ff-98dd-9fefb26127d3202034-1-145zfwr.nwf1", 
+                    verbose = FALSE, stringsAsFactors = TRUE)
+z11 <- utm.zones[utm.zones$ZONE == "11", ]
+z11t <- z11[z11$ROW_ == "T",]
+z11t_sf<-z11t %>% st_as_sf() 
+
+#clip riverATLAS with the zone 
+clip_data_na_z11t <- data_na_sf %>% sf::st_intersection(z11t_sf) %>% 
+  as("Spatial")
+
+clip_data_na_z11t_sf <- clip_data_na_z11t %>% st_as_sf()
+
+# select variables of interest
+select_cols <- subset(clip_data_na_z11t_sf, select = c(dis_m3_pyr,ele_mt_cav,tmp_dc_cyr,
+                                                       pre_mm_cyr,hft_ix_c93,
+                                                       hft_ix_c09))
+view(select_cols)
+
+select_cols_sp <- select_cols %>% as_Spatial()
+
+# read and join count and density data:
+count <- read.csv("count.csv",header=T,sep=",")
+dens <- read.csv("dens.csv",header=T,sep=",")
+points <- rbind(count,dens)
+
+points.sf <- points %>% 
+  dplyr::mutate(longitude=long,latitude=lat) %>% 
+  st_as_sf(coords = c(x = "longitude", y = "latitude"), crs = 4326)
+
+# clip of sites with the zone
+clip_points_11t<- points.sf %>% sf::st_intersection(z11t_sf)%>%  
+  as("Spatial") 
+
+# convert to UTM z11 
+atlas_11t_utm<- spTransform(select_cols_sp,CRS("+proj=utm +zone=11 +datum=WGS84 +ellps=WGS84"))
+points_11t_utm<- spTransform(clip_points_11t,CRS("+proj=utm +zone=11 +datum=WGS84 +ellps=WGS84"))
+
+# check if it are in the same projection:
+st_crs(atlas_11t_utm)==st_crs(points_11t_utm) #TRUE
+
+# snap function
+snap_11t <- maptools::snapPointsToLines(points_11t_utm, atlas_11t_utm, maxDist = NA, withAttrs = FALSE, idField = NA) %>% 
+  cbind(points_11t_utm@data) %>% 
+  st_as_sf()  
+
+# to be possible to obtain the environmental variables for the selected sites,
+# we also need to do a buffer in the database to intersect with the sites.
+atlas_11t_utm_sf <-atlas_11t_utm %>% st_as_sf()
+buffer_11t <- st_buffer(atlas_11t_utm_sf, 10)
+
+intersection <- snap_11t %>% sf::st_intersection(buffer_11t)
+
+# remove unnecessary columns:
+remov_cols <- subset(intersection, select = -c(FID:EAST_VALUE,nearest_line_id,snap_dist,
+                                               Quarter.y))
+
+hydro_atlas_11t <- remov_cols
+
+#
+### ok, now we will also snap the sites with the Free Flowing Rivers database
+
+ffr_na <- st_read(dsn="FFR_na_river_network_v1.shp") %>% # FFR Nort America
+  dplyr::select(CSI, CSI_FF2)
+
+# clip 
+clip_z11t_ffr <- ffr_na %>% sf::st_intersection(z11t_sf) %>% 
+  as("Spatial")
+
+# convert to UTM
+clip_z11t_ffr_utm<- spTransform(clip_z11t_ffr,CRS("+proj=utm +zone=11 +datum=WGS84 +ellps=WGS84"))
+
+# check if is the same projection:
+st_crs(points_11t_utm)==st_crs(clip_z11t_ffr_utm) #TRUE
+
+# snap function
+snap_ffr_11t <- maptools::snapPointsToLines(points_11t_utm, clip_z11t_ffr_utm, maxDist = NA, withAttrs = FALSE, idField = NA) %>% 
+  cbind(points_11t_utm@data) %>% 
+  st_as_sf()  
+
+clip_z11t_ffr_utm_sf <- clip_z11t_ffr_utm %>% st_as_sf() 
+
+# buffer 
+buffer10 <- st_buffer(clip_z11t_ffr_utm_sf, 10)
+
+# Intersection 
+points_info <- snap_ffr_11t %>% sf::st_intersection(buffer10)
+
+# select columns of interest:
+ffr_select_columns <- points_info %>% 
+  dplyr::select(HYBAS_ID,SiteID, CSI, CSI_FF2) %>% 
+  unique() %>% 
+  st_drop_geometry
+
+# Now, join the two tables:
+environment.11t <- full_join(hydro_atlas_11t,ffr_select_columns)
+view(environment.11t)
+
+environment.11t.drop.geo <- st_drop_geometry(environment.11t)
+
+write.table(environment.11t.drop.geo, file="environment.11t.csv",sep = ",") # export
