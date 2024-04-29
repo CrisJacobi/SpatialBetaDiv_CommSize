@@ -1,1 +1,0 @@
-# SpatialBetaDiv_CommSize
